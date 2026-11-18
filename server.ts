@@ -11,6 +11,11 @@
 //   POST /move    {"from": "...", "to": "..."}   move or rename
 //   GET  /healthz                   "ok"
 //
+// For people there is a web page that uses the same calls:
+//
+//   GET  /                          the page (ui.html)
+//   GET  /usage                     how full the folder's disk is, as JSON
+//
 // There is no delete and no authentication. Every path is relative to the
 // folder in BRIDGE_ROOT and cannot leave it.
 //
@@ -20,8 +25,8 @@
 // Node runs this file directly (type stripping): no build step, no dependencies.
 
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, realpathSync, statSync } from "node:fs";
-import { lstat, mkdir, readdir, realpath, rename, stat, unlink } from "node:fs/promises";
+import { createReadStream, createWriteStream, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstat, mkdir, readdir, realpath, rename, stat, statfs, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve, sep } from "node:path";
 import { Transform } from "node:stream";
@@ -39,7 +44,16 @@ export type BridgeOptions = {
 
 /** Uploads are written here first, then renamed into place, so a half-sent file is never visible. */
 const TMP_DIR = ".bridge-tmp";
+/** A freshly formatted volume has this folder at its top. It is not anyone's file, so it is not listed. */
+const FILESYSTEM_FOLDER = "lost+found";
 const DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
+
+/** The page for people, read once at start. It sits beside this file. */
+const UI_HTML = readFileSync(new URL("./ui.html", import.meta.url));
+/** The page may only talk to this server and run its own inline script and styles. */
+const UI_POLICY =
+  "default-src 'none'; connect-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; " +
+  "script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const MAX_JSON_BYTES = 64 * 1024;
 
 const ENDPOINTS = [
@@ -113,7 +127,7 @@ export function createBridge(options: BridgeOptions): Server {
     }
     const entries = [];
     for (const entry of await readdir(dir, { withFileTypes: true })) {
-      if (parts.length === 0 && entry.name === TMP_DIR) continue;
+      if (parts.length === 0 && (entry.name === TMP_DIR || entry.name === FILESYSTEM_FOLDER)) continue;
       const info = await stat(join(dir, entry.name)).catch(() => null);
       if (info === null) continue; // a broken link
       entries.push({
@@ -134,8 +148,10 @@ export function createBridge(options: BridgeOptions): Server {
     if (info.isDirectory()) {
       throw new HttpError(400, "that is a folder; list it with GET /list?path=<folder>");
     }
+    // Always plain bytes, never a type a browser would run: files here come from agents.
     res.writeHead(200, {
       "content-type": "application/octet-stream",
+      "x-content-type-options": "nosniff",
       "content-length": info.size,
       "last-modified": info.mtime.toUTCString(),
     });
@@ -144,6 +160,16 @@ export function createBridge(options: BridgeOptions): Server {
       return;
     }
     await pipeline(createReadStream(file), res);
+  }
+
+  async function usage(res: ServerResponse): Promise<void> {
+    const disk = await statfs(root);
+    const totalBytes = disk.blocks * disk.bsize;
+    sendJson(res, 200, {
+      totalBytes,
+      usedBytes: totalBytes - disk.bfree * disk.bsize,
+      freeBytes: disk.bavail * disk.bsize,
+    });
   }
 
   async function upload(parts: string[], url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -212,6 +238,19 @@ export function createBridge(options: BridgeOptions): Server {
     if (path === "/healthz") {
       allow(method, ["GET", "HEAD"]);
       res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
+    } else if (path === "/") {
+      allow(method, ["GET", "HEAD"]);
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-length": UI_HTML.length,
+        "content-security-policy": UI_POLICY,
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-cache",
+      });
+      res.end(method === "HEAD" ? undefined : UI_HTML);
+    } else if (path === "/usage") {
+      allow(method, ["GET"]);
+      await usage(res);
     } else if (path === "/list") {
       allow(method, ["GET"]);
       await list(url, res);

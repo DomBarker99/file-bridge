@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>file bridge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  The page people use to look at the shared folder. server.ts serves it at "/".
+  It only uses the same calls an agent uses (/list, /files, /mkdir, /move) plus
+  /usage, so what is shown here is exactly what an agent sees. There is no delete.
+  No build step and no libraries: this one file is the whole page.
+-->
+<style>
+  :root { --ink:#1c2530; --dim:#5d6878; --line:#dde1e6; --bg:#f4f5f7; --card:#fff; --link:#2f6fb5; --ok:#1f7a4d; --bad:#a33a30; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 22px 18px 60px; }
+  header { display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  h1 { font-size: 22px; margin: 0; }
+  .usage { margin-left:auto; color:var(--dim); font-size:13.5px; display:flex; align-items:center; gap:10px; }
+  .meter { width:160px; height:8px; border-radius:99px; background:#e3e6ea; overflow:hidden; }
+  .meter i { display:block; height:100%; background:var(--link); width:0; }
+  .bar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:16px 0 10px; }
+  .crumbs { font-size:15px; flex:1 1 auto; min-width:200px; overflow-wrap:anywhere; }
+  .crumbs a { color:var(--link); text-decoration:none; }
+  .crumbs span { color:var(--dim); margin:0 5px; }
+  button, .btn { font:inherit; font-size:14px; padding:6px 12px; border:1px solid #c5ccd5; border-radius:7px; background:#fff; color:var(--ink); cursor:pointer; text-decoration:none; display:inline-block; }
+  button:hover, .btn:hover { background:#f0f3f6; }
+  button.quiet { border-color:transparent; background:none; color:var(--link); padding:2px 6px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid #e8ebef; vertical-align:middle; }
+  th { font-size:12.5px; color:var(--dim); font-weight:600; background:#f7f8fa; }
+  tr:last-child td { border-bottom:0; }
+  td.name { overflow-wrap:anywhere; }
+  td.name a { color:var(--ink); text-decoration:none; cursor:pointer; }
+  td.name a:hover { color:var(--link); }
+  td.num, th.num { text-align:right; white-space:nowrap; color:var(--dim); font-size:13.5px; }
+  td.act { text-align:right; white-space:nowrap; }
+  .kind { display:inline-block; width:64px; font-size:11px; font-weight:700; color:var(--dim); letter-spacing:.04em; white-space:nowrap; }
+  .kind.dir { color:var(--link); }
+  .empty { padding:26px 12px; color:var(--dim); text-align:center; }
+  .drop { margin-top:10px; border:1.5px dashed #c5ccd5; border-radius:10px; padding:14px; text-align:center; color:var(--dim); font-size:14px; }
+  body.dragging .drop { border-color:var(--link); color:var(--link); background:#eef4fb; }
+  #status { min-height:22px; margin:10px 2px 0; font-size:14px; color:var(--dim); }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  #preview { margin-top:16px; display:none; }
+  #preview .head { display:flex; align-items:center; gap:10px; padding:9px 12px; border-bottom:1px solid var(--line); background:#f7f8fa; font-size:14px; }
+  #preview .head b { flex:1 1 auto; overflow-wrap:anywhere; }
+  #preview pre { margin:0; padding:12px 14px; max-height:520px; overflow:auto; font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  #preview img { display:block; max-width:100%; max-height:620px; margin:0 auto; }
+  .note { color:var(--dim); font-size:13px; margin-top:18px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>file bridge</h1>
+    <div class="usage"><span id="usageText">&nbsp;</span><div class="meter"><i id="usageBar"></i></div></div>
+  </header>
+
+  <div class="bar">
+    <div class="crumbs" id="crumbs"></div>
+    <button id="newFolder">New folder</button>
+    <label class="btn">Upload<input id="pick" type="file" multiple hidden></label>
+    <button id="refresh">Refresh</button>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Changed</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>This folder is empty.</div>
+  </div>
+  <div class="drop">Drop files anywhere on this page to upload them into this folder.</div>
+  <div id="status"></div>
+
+  <div class="card" id="preview">
+    <div class="head"><b id="previewName"></b><a class="btn" id="previewDownload">Download</a><button id="previewClose">Close</button></div>
+    <div id="previewBody"></div>
+  </div>
+
+  <p class="note">This is the folder agents reach with curl. Nothing can be deleted from here. An upload to a name that already exists asks before it replaces the file.</p>
+</main>
+
+<script>
+"use strict";
+
+const TEXT = ["txt","md","json","yaml","yml","csv","tsv","log","xml","html","htm","css","js","mjs","ts","tsx","jsx","py","sh","go","rs","java","c","h","cpp","toml","ini","conf","env","sql","tex"];
+const IMAGE = { png:"image/png", jpg:"image/jpeg", jpeg:"image/jpeg", gif:"image/gif", webp:"image/webp" };
+const MAX_PREVIEW = 2 * 1024 * 1024;
+
+const $ = (id) => document.getElementById(id);
+let cwd = [];          // the folder being shown, as path segments
+let objectUrl = null;  // the image or PDF currently previewed
+
+/* ---------- small helpers ---------- */
+
+const urlPath = (parts) => parts.map(encodeURIComponent).join("/");
+const fileUrl = (parts) => "/files/" + urlPath(parts);
+
+function size(bytes) {
+  if (bytes === null || bytes === undefined) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let n = bytes, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + units[i];
+}
+
+function when(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) + " " +
+         d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function say(text, kind) {
+  $("status").textContent = text;
+  $("status").className = kind || "";
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  if (!res.ok) throw Object.assign(new Error((body && body.error) || ("HTTP " + res.status)), { status: res.status });
+  return body;
+}
+
+function el(tag, props, ...children) {
+  const node = Object.assign(document.createElement(tag), props || {});
+  for (const child of children) node.append(child);
+  return node;
+}
+
+/* ---------- showing a folder ---------- */
+
+function readHash() {
+  const raw = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+  return raw.split("/").filter((p) => p !== "" && p !== "." && p !== "..");
+}
+
+function go(parts) {
+  location.hash = "#/" + urlPath(parts);
+}
+
+function drawCrumbs() {
+  const box = $("crumbs");
+  box.replaceChildren(el("a", { href: "#/", textContent: "Home" }));
+  cwd.forEach((part, i) => {
+    box.append(el("span", { textContent: "/" }));
+    box.append(el("a", { href: "#/" + urlPath(cwd.slice(0, i + 1)), textContent: part }));
+  });
+}
+
+async function show() {
+  cwd = readHash();
+  drawCrumbs();
+  closePreview();
+  let listing;
+  try {
+    listing = await api("/list?path=" + encodeURIComponent(cwd.join("/")));
+  } catch (error) {
+    $("rows").replaceChildren();
+    $("empty").hidden = true;
+    say("Could not open this folder: " + error.message, "bad");
+    return;
+  }
+  const entries = listing.entries.slice().sort((a, b) =>
+    (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
+  const rows = entries.map((entry) => {
+    const path = cwd.concat(entry.name);
+    const isDir = entry.type === "dir";
+    const link = el("a", { textContent: entry.name });
+    if (isDir) link.href = "#/" + urlPath(path);
+    else link.addEventListener("click", () => preview(path, entry));
+    const actions = el("td", { className: "act" });
+    if (!isDir) actions.append(el("a", { className: "btn", href: fileUrl(path), download: entry.name, textContent: "Download" }), " ");
+    const move = el("button", { className: "quiet", textContent: "Move or rename" });
+    move.addEventListener("click", () => moveEntry(path));
+    actions.append(move);
+    return el("tr", null,
+      el("td", { className: "name" }, el("span", { className: "kind" + (isDir ? " dir" : ""), textContent: isDir ? "FOLDER" : "FILE" }), link),
+      el("td", { className: "num", textContent: isDir ? "" : size(entry.size) }),
+      el("td", { className: "num", textContent: when(entry.modified) }),
+      actions);
+  });
+  $("rows").replaceChildren(...rows);
+  $("empty").hidden = rows.length > 0;
+  usage();
+}
+
+async function usage() {
+  try {
+    const u = await api("/usage");
+    $("usageText").textContent = size(u.usedBytes) + " of " + size(u.totalBytes) + " used";
+    $("usageBar").style.width = Math.max(1, Math.min(100, (u.usedBytes / u.totalBytes) * 100)) + "%";
+  } catch { $("usageText").textContent = ""; }
+}
+
+/* ---------- preview ---------- */
+
+function closePreview() {
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+  $("preview").style.display = "none";
+  $("previewBody").replaceChildren();
+}
+
+async function preview(path, entry) {
+  closePreview();
+  const ext = (entry.name.includes(".") ? entry.name.split(".").pop() : "").toLowerCase();
+  $("previewName").textContent = path.join("/");
+  Object.assign($("previewDownload"), { href: fileUrl(path), download: entry.name });
+  const body = $("previewBody");
+  $("preview").style.display = "block";
+  const tell = (text) => body.replaceChildren(el("pre", { textContent: text }));
+
+  if (entry.size > MAX_PREVIEW && ext !== "pdf") return tell("This file is " + size(entry.size) + ", too large to show here. Download it instead.");
+  try {
+    const res = await fetch(fileUrl(path));
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (IMAGE[ext]) {
+      // The server sends every file as plain bytes. The type is set here, and
+      // only for kinds a browser shows without running anything.
+      objectUrl = URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: IMAGE[ext] }));
+      body.replaceChildren(el("img", { src: objectUrl, alt: entry.name }));
+    } else if (ext === "pdf") {
+      objectUrl = URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: "application/pdf" }));
+      body.replaceChildren(el("pre", null, "PDF. ", el("a", { href: objectUrl, target: "_blank", rel: "noopener", textContent: "Open it in a new tab" }), "."));
+    } else if (TEXT.includes(ext) || entry.size < 64 * 1024) {
+      const text = await res.text();
+      tell(/\u0000/.test(text) ? "This does not look like text. Download it instead." : (text === "" ? "(empty file)" : text));
+    } else {
+      tell("No preview for this kind of file. Download it instead.");
+    }
+  } catch (error) {
+    tell("Could not read the file: " + error.message);
+  }
+  $("preview").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/* ---------- changing things ---------- */
+
+async function newFolder() {
+  const name = prompt("Name of the new folder:");
+  if (!name) return;
+  try {
+    await api("/mkdir", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: cwd.concat(name).join("/") }) });
+    say("Made the folder " + name + ".", "ok");
+    show();
+  } catch (error) { say("Could not make the folder: " + error.message, "bad"); }
+}
+
+async function moveEntry(path) {
+  const from = path.join("/");
+  const to = prompt("Move or rename. New path, from the top of the shared folder:", from);
+  if (!to || to === from) return;
+  try {
+    await api("/move", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from, to }) });
+    say("Moved " + from + " to " + to + ".", "ok");
+    show();
+  } catch (error) { say("Could not move it: " + error.message, "bad"); }
+}
+
+/** One upload, with a percentage. Resolves to the HTTP status. */
+function put(file, parts, overwrite, label) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", fileUrl(parts) + (overwrite ? "?overwrite=true" : ""));
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) say(label + " " + Math.round((e.loaded / e.total) * 100) + "%"); };
+    xhr.onload = () => {
+      let message = "";
+      try { message = JSON.parse(xhr.responseText).error || ""; } catch { /* not JSON */ }
+      resolve({ status: xhr.status, message });
+    };
+    xhr.onerror = () => reject(new Error("the connection was lost"));
+    xhr.send(file);
+  });
+}
+
+async function upload(files) {
+  const list = Array.from(files);
+  if (list.length === 0) return;
+  let done = 0;
+  const kept = [];
+  for (const [i, file] of list.entries()) {
+    const parts = cwd.concat(file.name);
+    const label = "Uploading " + (i + 1) + " of " + list.length + ": " + file.name;
+    say(label);
+    try {
+      let result = await put(file, parts, false, label);
+      if (result.status === 409 && confirm(file.name + " is already in this folder. Replace it?")) {
+        result = await put(file, parts, true, label);
+      }
+      if (result.status === 409) { kept.push(file.name); continue; }
+      if (result.status >= 300) throw new Error(result.message || ("HTTP " + result.status));
+      done++;
+    } catch (error) {
+      say("Could not upload " + file.name + ": " + error.message, "bad");
+      show();
+      return;
+    }
+  }
+  say("Uploaded " + done + " of " + list.length + (list.length === 1 ? " file." : " files.") +
+      (kept.length ? " Left as it was: " + kept.join(", ") + "." : ""), done === list.length ? "ok" : "");
+  show();
+}
+
+/* ---------- wiring ---------- */
+
+$("newFolder").addEventListener("click", newFolder);
+$("refresh").addEventListener("click", () => { say(""); show(); });
+$("previewClose").addEventListener("click", closePreview);
+$("pick").addEventListener("change", (e) => { upload(e.target.files); e.target.value = ""; });
+
+let depth = 0;
+window.addEventListener("dragenter", (e) => { e.preventDefault(); depth++; document.body.classList.add("dragging"); });
+window.addEventListener("dragleave", () => { if (--depth <= 0) { depth = 0; document.body.classList.remove("dragging"); } });
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  depth = 0;
+  document.body.classList.remove("dragging");
+  if (e.dataTransfer && e.dataTransfer.files.length) upload(e.dataTransfer.files);
+});
+
+window.addEventListener("hashchange", show);
+show();
+</script>
+</body>
+</html>

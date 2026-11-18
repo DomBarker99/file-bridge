@@ -161,6 +161,38 @@ test("an upload over the limit is refused and leaves nothing behind", async () =
   }
 });
 
+test("the page for people, the usage numbers, and what is kept out of sight", async () => {
+  const bridge = await start();
+  try {
+    const page = await fetch(`${bridge.url}/`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("content-type") ?? "", /^text\/html/);
+    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+    assert.match(await page.text(), /<title>file bridge<\/title>/);
+    assert.equal((await fetch(`${bridge.url}/`, { method: "POST" })).status, 405);
+
+    const usage = await (await fetch(`${bridge.url}/usage`)).json();
+    assert.ok(usage.totalBytes > 0 && usage.freeBytes > 0);
+    assert.ok(usage.usedBytes >= 0 && usage.usedBytes <= usage.totalBytes);
+
+    // The folder a new volume starts with is hidden at the top, and only there.
+    await mkdir(join(bridge.root, "lost+found"));
+    await mkdir(join(bridge.root, "kept/lost+found"), { recursive: true });
+    const names = async (path: string) =>
+      (await (await fetch(`${bridge.url}/list?path=${encodeURIComponent(path)}`)).json()).entries.map((entry: { name: string }) => entry.name);
+    assert.deepEqual(await names(""), ["kept"]);
+    assert.deepEqual(await names("kept"), ["lost+found"]);
+
+    // A file is always sent as plain bytes, whatever its name says.
+    await fetch(`${bridge.url}/files/page.html`, { method: "PUT", body: "<script>alert(1)</script>" });
+    const file = await fetch(`${bridge.url}/files/page.html`);
+    assert.equal(file.headers.get("content-type"), "application/octet-stream");
+    assert.equal(file.headers.get("x-content-type-options"), "nosniff");
+  } finally {
+    await bridge.close();
+  }
+});
+
 test("wrong addresses and methods explain themselves", async () => {
   const bridge = await start();
   try {

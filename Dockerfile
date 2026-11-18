@@ -1,5 +1,5 @@
-# file-bridge: one TypeScript file, run by Node directly (type stripping).
-# There is no build step and there are no dependencies.
+# file-bridge: one TypeScript file, run by Node directly (type stripping), and the one
+# HTML page it serves to people. There is no build step and there are no dependencies.
 #
 # GitHub Actions builds this on every push to main (.github/workflows/image.yaml).
 #
@@ -15,7 +15,7 @@ RUN addgroup -S -g 65532 bridge && \
     adduser -S -D -u 65532 -G bridge bridge && \
     mkdir -p /srv/files && \
     chown 65532:65532 /srv/files
-COPY server.ts /app/server.ts
+COPY server.ts ui.html /app/
 USER 65532:65532
 ENV BRIDGE_ROOT=/srv/files \
     PORT=8080
