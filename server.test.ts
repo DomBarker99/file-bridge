@@ -167,9 +167,17 @@ test("the page for people, the usage numbers, and what is kept out of sight", as
     const page = await fetch(`${bridge.url}/`);
     assert.equal(page.status, 200);
     assert.match(page.headers.get("content-type") ?? "", /^text\/html/);
-    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'none'/);
+    // No inline script may run on the page: text from an agent's file can never become code.
+    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'none'; script-src 'self'; style-src 'self'/);
     assert.match(await page.text(), /<title>file bridge<\/title>/);
     assert.equal((await fetch(`${bridge.url}/`, { method: "POST" })).status, 405);
+    for (const [name, type] of [["app.js", "text/javascript"], ["app.css", "text/css"], ["vendor/highlight.min.js", "text/javascript"], ["vendor/markdown-it.min.js", "text/javascript"]]) {
+      const asset = await fetch(`${bridge.url}/assets/${name}`);
+      assert.equal(asset.status, 200, name);
+      assert.match(asset.headers.get("content-type") ?? "", new RegExp(`^${type}`));
+    }
+    assert.equal((await fetch(`${bridge.url}/assets/nope.js`)).status, 404);
+    assert.equal((await fetch(`${bridge.url}/assets/..%2Fserver.ts`)).status, 404);
 
     const usage = await (await fetch(`${bridge.url}/usage`)).json();
     assert.ok(usage.totalBytes > 0 && usage.freeBytes > 0);
@@ -188,6 +196,57 @@ test("the page for people, the usage numbers, and what is kept out of sight", as
     const file = await fetch(`${bridge.url}/files/page.html`);
     assert.equal(file.headers.get("content-type"), "application/octet-stream");
     assert.equal(file.headers.get("x-content-type-options"), "nosniff");
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("stat, find, and showing a file in a browser", async () => {
+  const bridge = await start();
+  try {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+    await fetch(`${bridge.url}/files/reports/2026/Summary.md`, { method: "PUT", body: "# hi\n" });
+    await fetch(`${bridge.url}/files/reports/chart.png`, { method: "PUT", body: png });
+    await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { method: "PUT", body: "0123456789" });
+
+    const file = await (await fetch(`${bridge.url}/stat?path=reports/2026/Summary.md`)).json();
+    assert.deepEqual([file.type, file.size], ["file", 5]);
+    assert.equal((await (await fetch(`${bridge.url}/stat?path=reports`)).json()).type, "dir");
+    assert.equal((await fetch(`${bridge.url}/stat?path=nope`)).status, 404);
+    assert.equal((await fetch(`${bridge.url}/stat?path=../x`)).status, 400);
+
+    // Every word has to be somewhere in the path; a match in the name comes first.
+    const found = async (q: string) => (await (await fetch(`${bridge.url}/find?q=${encodeURIComponent(q)}`)).json()).results.map((hit: { path: string }) => hit.path);
+    assert.deepEqual(await found("summary"), ["reports/2026/Summary.md", "notes/summary of reports.txt"]);
+    assert.deepEqual(await found("REPORTS chart"), ["reports/chart.png"]);
+    assert.deepEqual(await found("2026"), ["reports/2026", "reports/2026/Summary.md"]);
+    assert.deepEqual(await found("zzz"), []);
+    assert.equal((await fetch(`${bridge.url}/find?q=`)).status, 400);
+
+    // /view gives a picture its real type and refuses anything a browser could run.
+    const shown = await fetch(`${bridge.url}/view/reports/chart.png`);
+    assert.equal(shown.headers.get("content-type"), "image/png");
+    assert.ok(Buffer.from(await shown.arrayBuffer()).equals(png));
+    await fetch(`${bridge.url}/files/page.html`, { method: "PUT", body: "<script>1</script>" });
+    await fetch(`${bridge.url}/files/drawing.svg`, { method: "PUT", body: "<svg/>" });
+    assert.equal((await fetch(`${bridge.url}/view/page.html`)).status, 415);
+    assert.equal((await fetch(`${bridge.url}/view/drawing.svg`)).status, 415);
+    assert.equal((await fetch(`${bridge.url}/view/reports/chart.png`, { method: "PUT", body: "x" })).status, 405);
+
+    // Part of a file, the way a video player asks for it.
+    const part = await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { headers: { range: "bytes=2-5" } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get("content-range"), "bytes 2-5/10");
+    assert.equal(await part.text(), "2345");
+    const tail = await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { headers: { range: "bytes=-3" } });
+    assert.equal(await tail.text(), "789");
+    const rest = await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { headers: { range: "bytes=7-" } });
+    assert.equal(await rest.text(), "789");
+    assert.equal((await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { headers: { range: "bytes=50-60" } })).status, 416);
+    const head = await fetch(`${bridge.url}/files/notes/summary of reports.txt`, { method: "HEAD" });
+    assert.deepEqual([head.status, head.headers.get("content-length"), head.headers.get("accept-ranges")], [200, "10", "bytes"]);
+    await fetch(`${bridge.url}/files/empty.txt`, { method: "PUT", body: "" });
+    assert.equal(await (await fetch(`${bridge.url}/files/empty.txt`)).text(), "");
   } finally {
     await bridge.close();
   }

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>file bridge</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  The page people use to look at the shared folder. server.ts serves it at "/",
+  and the other files in this folder at /assets/. It uses the same calls an
+  agent uses, so what is shown here is exactly what an agent sees. There is no
+  delete. No build step: app.js and app.css are the whole page, and vendor/
+  holds the two libraries it uses (code colouring and Markdown).
+-->
+<link rel="stylesheet" href="/assets/vendor/github.min.css" id="hlLight">
+<link rel="stylesheet" href="/assets/vendor/github-dark.min.css" id="hlDark" disabled>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="top">
+  <button id="toggleTree" class="icon" title="Show or hide the folder tree" aria-label="Show or hide the folder tree"></button>
+  <a class="brand" href="#/">file bridge</a>
+  <div class="find">
+    <input id="find" type="search" placeholder="Go to file" autocomplete="off" spellcheck="false" aria-label="Go to file">
+    <div id="findResults" class="results" hidden></div>
+  </div>
+  <div class="usage"><span id="usageText"></span><div class="meter"><i id="usageBar"></i></div></div>
+  <button id="theme" title="Switch between light, dark and following the system"></button>
+</header>
+
+<div class="layout">
+  <nav id="tree" class="tree" aria-label="Folders and files"></nav>
+
+  <main>
+    <div class="bar">
+      <div class="crumbs" id="crumbs"></div>
+      <div class="actions">
+        <button id="newFolder">New folder</button>
+        <label class="btn">Upload<input id="pick" type="file" multiple hidden></label>
+      </div>
+    </div>
+
+    <section class="box" id="folder">
+      <table>
+        <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Last changed</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" hidden>This folder is empty. Drop files here to upload them.</div>
+    </section>
+
+    <section class="box" id="file" hidden>
+      <div class="filehead">
+        <span id="fileInfo"></span>
+        <span class="seg" id="modes" hidden></span>
+        <a class="btn" id="download">Download</a>
+        <button id="moveFile">Move or rename</button>
+      </div>
+      <div id="fileBody"></div>
+    </section>
+
+    <section class="box message" id="missing" hidden></section>
+
+    <p class="note">This is the folder agents reach with curl. Nothing can be deleted from here. An upload to a name that already exists asks before it replaces the file.</p>
+  </main>
+</div>
+
+<div id="drop" class="drop" hidden><div>Drop to upload into <b id="dropWhere"></b></div></div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="/assets/vendor/highlight.min.js"></script>
+<script src="/assets/vendor/markdown-it.min.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

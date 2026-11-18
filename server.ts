@@ -11,9 +11,15 @@
 //   POST /move    {"from": "...", "to": "..."}   move or rename
 //   GET  /healthz                   "ok"
 //
-// For people there is a web page that uses the same calls:
+//   GET  /stat?path=<path>          is it a file or a folder, its size and when it changed
+//   GET  /find?q=<text>             files and folders whose path contains every word in q
 //
-//   GET  /                          the page (ui.html)
+// For people there is a web page (the ui/ folder) that uses the same calls, plus:
+//
+//   GET  /                          the page
+//   GET  /assets/<file>             its script, styles and the two libraries it uses
+//   GET  /view/<path>               a picture, PDF, sound or video with its real type, so a
+//                                   browser shows it. Every other kind of file is refused here.
 //   GET  /usage                     how full the folder's disk is, as JSON
 //
 // There is no delete and no authentication. Every path is relative to the
@@ -25,10 +31,10 @@
 // Node runs this file directly (type stripping): no build step, no dependencies.
 
 import { randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, readFileSync, realpathSync, statSync } from "node:fs";
+import { createReadStream, createWriteStream, readdirSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
 import { lstat, mkdir, readdir, realpath, rename, stat, statfs, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, extname, join, resolve, sep } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -48,16 +54,54 @@ const TMP_DIR = ".bridge-tmp";
 const FILESYSTEM_FOLDER = "lost+found";
 const DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
 
-/** The page for people, read once at start. It sits beside this file. */
-const UI_HTML = readFileSync(new URL("./ui.html", import.meta.url));
-/** The page may only talk to this server and run its own inline script and styles. */
+/**
+ * The page for people: every file in ui/ and ui/vendor/ beside this file, read
+ * once at start and served from memory, so a request never touches the disk.
+ */
+const UI_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+};
+const UI_FILES = new Map<string, { body: Buffer; type: string }>();
+for (const folder of ["", "vendor/"]) {
+  const dir = new URL(`./ui/${folder}`, import.meta.url);
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const type = UI_TYPES[extname(entry.name)];
+    if (entry.isFile() && type !== undefined) {
+      UI_FILES.set(folder + entry.name, { body: readFileSync(new URL(entry.name, dir)), type });
+    }
+  }
+}
+/**
+ * The page may only load its own files and talk to this server. No inline script
+ * runs, so text that came from an agent cannot become code even if it slipped
+ * through the page's own escaping.
+ */
 const UI_POLICY =
-  "default-src 'none'; connect-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; " +
-  "script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; " +
+  "frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/**
+ * Kinds of file that /view sends with their real type. Only kinds a browser
+ * shows without running anything from them: no HTML and no SVG.
+ */
+const VIEW_TYPES: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".webp": "image/webp", ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
+  ".pdf": "application/pdf",
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".ogg": "audio/ogg", ".flac": "audio/flac",
+};
+/** /find stops looking after this many files and folders, so one search cannot tie the server up. */
+const FIND_SCAN_LIMIT = 50_000;
 const MAX_JSON_BYTES = 64 * 1024;
 
 const ENDPOINTS = [
   "GET /list?path=<folder>",
+  "GET /stat?path=<path>",
+  "GET /find?q=<text>",
   "GET /files/<path>",
   "PUT /files/<path>[?overwrite=true]",
   'POST /mkdir {"path": "..."}',
@@ -141,7 +185,91 @@ export function createBridge(options: BridgeOptions): Server {
     sendJson(res, 200, { path: parts.join("/"), entries });
   }
 
-  async function download(parts: string[], headOnly: boolean, res: ServerResponse): Promise<void> {
+  async function describeEntry(url: URL, res: ServerResponse): Promise<void> {
+    const parts = splitPath(url.searchParams.get("path") ?? "");
+    const info = await stat(await inside(parts));
+    sendJson(res, 200, {
+      path: parts.join("/"),
+      type: info.isDirectory() ? "dir" : "file",
+      size: info.isDirectory() ? null : info.size,
+      modified: info.mtime.toISOString(),
+    });
+  }
+
+  /** Every file and folder whose path contains each word of q, whatever the letter case. */
+  async function find(url: URL, res: ServerResponse): Promise<void> {
+    const words = (url.searchParams.get("q") ?? "").toLowerCase().split(/\s+/).filter((word) => word !== "");
+    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 500);
+    if (words.length === 0) throw new HttpError(400, "give something to look for: /find?q=<text>");
+    const found: { path: string; type: string; size: number | null; modified: string }[] = [];
+    const queue: string[][] = [[]];
+    let scanned = 0;
+    while (queue.length > 0 && scanned < FIND_SCAN_LIMIT) {
+      const parts = queue.shift() as string[];
+      const entries = await readdir(join(root, ...parts), { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (parts.length === 0 && (entry.name === TMP_DIR || entry.name === FILESYSTEM_FOLDER)) continue;
+        if (!entry.isDirectory() && !entry.isFile()) continue; // links are not followed
+        scanned++;
+        const path = [...parts, entry.name];
+        if (entry.isDirectory()) queue.push(path);
+        const joined = path.join("/");
+        if (!words.every((word) => joined.toLowerCase().includes(word))) continue;
+        const info = await stat(join(root, ...path)).catch(() => null);
+        if (info === null) continue;
+        found.push({
+          path: joined,
+          type: entry.isDirectory() ? "dir" : "file",
+          size: entry.isDirectory() ? null : info.size,
+          modified: info.mtime.toISOString(),
+        });
+      }
+    }
+    // Names that match come before paths that only match through a folder; shorter paths first.
+    const inName = (path: string) => words.every((word) => (path.split("/").pop() as string).toLowerCase().includes(word));
+    found.sort((a, b) => Number(inName(b.path)) - Number(inName(a.path)) || a.path.length - b.path.length || a.path.localeCompare(b.path));
+    sendJson(res, 200, {
+      query: words.join(" "),
+      results: found.slice(0, limit),
+      more: found.length > limit || queue.length > 0,
+    });
+  }
+
+  /** Send a file, or the part of it a Range header asks for (what a video player does to skip ahead). */
+  async function sendFile(file: string, info: Stats, type: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const headers: Record<string, string | number> = {
+      "content-type": type,
+      "x-content-type-options": "nosniff",
+      "accept-ranges": "bytes",
+      "last-modified": info.mtime.toUTCString(),
+    };
+    let start = 0;
+    let end = info.size - 1;
+    let status = 200;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+    if (range !== null && (range[1] !== "" || range[2] !== "") && info.size > 0) {
+      if (range[1] === "") start = Math.max(info.size - Number(range[2]), 0);
+      else {
+        start = Number(range[1]);
+        if (range[2] !== "") end = Math.min(Number(range[2]), info.size - 1);
+      }
+      if (start > end || start >= info.size) {
+        res.writeHead(416, { ...headers, "content-range": `bytes */${info.size}`, "content-length": 0 }).end();
+        return;
+      }
+      status = 206;
+      headers["content-range"] = `bytes ${start}-${end}/${info.size}`;
+    }
+    headers["content-length"] = info.size === 0 ? 0 : end - start + 1;
+    res.writeHead(status, headers);
+    if (req.method === "HEAD" || info.size === 0) {
+      res.end();
+      return;
+    }
+    await pipeline(createReadStream(file, { start, end }), res);
+  }
+
+  async function download(parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (parts.length === 0) throw new HttpError(400, "give a file path: /files/<path>");
     const file = await inside(parts);
     const info = await stat(file);
@@ -149,17 +277,19 @@ export function createBridge(options: BridgeOptions): Server {
       throw new HttpError(400, "that is a folder; list it with GET /list?path=<folder>");
     }
     // Always plain bytes, never a type a browser would run: files here come from agents.
-    res.writeHead(200, {
-      "content-type": "application/octet-stream",
-      "x-content-type-options": "nosniff",
-      "content-length": info.size,
-      "last-modified": info.mtime.toUTCString(),
-    });
-    if (headOnly) {
-      res.end();
-      return;
+    await sendFile(file, info, "application/octet-stream", req, res);
+  }
+
+  async function view(parts: string[], req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (parts.length === 0) throw new HttpError(400, "give a file path: /view/<path>");
+    const type = VIEW_TYPES[extname(parts[parts.length - 1]).toLowerCase()];
+    if (type === undefined) {
+      throw new HttpError(415, "this kind of file is not shown in a browser; download it with GET /files/<path>");
     }
-    await pipeline(createReadStream(file), res);
+    const file = await inside(parts);
+    const info = await stat(file);
+    if (info.isDirectory()) throw new HttpError(400, "that is a folder");
+    await sendFile(file, info, type, req, res);
   }
 
   async function usage(res: ServerResponse): Promise<void> {
@@ -238,33 +368,47 @@ export function createBridge(options: BridgeOptions): Server {
     if (path === "/healthz") {
       allow(method, ["GET", "HEAD"]);
       res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
-    } else if (path === "/") {
+    } else if (path === "/favicon.ico") {
+      // Browsers ask for this by themselves. There is no picture; say so quietly.
       allow(method, ["GET", "HEAD"]);
+      res.writeHead(204).end();
+    } else if (path === "/" || path.startsWith("/assets/")) {
+      allow(method, ["GET", "HEAD"]);
+      const asset = UI_FILES.get(path === "/" ? "index.html" : path.slice("/assets/".length));
+      if (asset === undefined) throw new HttpError(404, `unknown address ${path}`);
       res.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "content-length": UI_HTML.length,
+        "content-type": asset.type,
+        "content-length": asset.body.length,
         "content-security-policy": UI_POLICY,
         "x-content-type-options": "nosniff",
         "cache-control": "no-cache",
       });
-      res.end(method === "HEAD" ? undefined : UI_HTML);
+      res.end(method === "HEAD" ? undefined : asset.body);
     } else if (path === "/usage") {
       allow(method, ["GET"]);
       await usage(res);
     } else if (path === "/list") {
       allow(method, ["GET"]);
       await list(url, res);
-    } else if (path === "/files" || path.startsWith("/files/")) {
-      allow(method, ["GET", "HEAD", "PUT"]);
+    } else if (path === "/stat") {
+      allow(method, ["GET"]);
+      await describeEntry(url, res);
+    } else if (path === "/find") {
+      allow(method, ["GET"]);
+      await find(url, res);
+    } else if (path === "/files" || path.startsWith("/files/") || path === "/view" || path.startsWith("/view/")) {
+      const viewing = path.startsWith("/view");
+      allow(method, viewing ? ["GET", "HEAD"] : ["GET", "HEAD", "PUT"]);
       let decoded: string;
       try {
-        decoded = decodeURIComponent(path.slice("/files".length));
+        decoded = decodeURIComponent(path.slice(viewing ? "/view".length : "/files".length));
       } catch {
         throw new HttpError(400, "path is not valid percent-encoding");
       }
       const parts = splitPath(decoded);
-      if (method === "PUT") await upload(parts, url, req, res);
-      else await download(parts, method === "HEAD", res);
+      if (viewing) await view(parts, req, res);
+      else if (method === "PUT") await upload(parts, url, req, res);
+      else await download(parts, req, res);
     } else if (path === "/mkdir") {
       allow(method, ["POST"]);
       await makeFolder(req, res);
